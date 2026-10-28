@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""Copy non-shared IntelliJ IDEA run configurations from one project to another.
+
+IDEA stores a non-shared run configuration in `.idea/workspace.xml`, inside the
+`RunManager` component. This tool reads that component in the source project,
+lets you pick configurations, and merges them into the `workspace.xml` of the
+target project. It detects a conflict when the target already has a
+configuration with the same type and name, or a shared one with the same name.
+
+Close the target project in IDEA before you copy. IDEA rewrites `workspace.xml`
+from memory and drops changes that it did not make.
+"""
+
+import argparse
+import copy
+import difflib
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+HOME = os.path.expanduser("~")
+JETBRAINS_CONFIG = os.path.join(HOME, "Library", "Application Support", "JetBrains")
+
+
+# ---------------------------------------------------------------- terminal
+
+def color(text, code):
+    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
+
+
+def bold(text):
+    return color(text, "1")
+
+
+def dim(text):
+    return color(text, "2")
+
+
+def yellow(text):
+    return color(text, "33")
+
+
+def green(text):
+    return color(text, "32")
+
+
+def red(text):
+    return color(text, "31")
+
+
+def ask(prompt, default=None):
+    try:
+        answer = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(130)
+    return answer if answer else (default or "")
+
+
+def confirm(prompt, default=False):
+    hint = "[Y/n]" if default else "[y/N]"
+    answer = ask(f"{prompt} {hint} ").lower()
+    return default if not answer else answer in ("y", "yes")
+
+
+def parse_selection(text, count):
+    """Parse '1 3 5-7', '1,2' or 'a' into a sorted list of 0-based indices."""
+    if text.lower() in ("a", "all", "*"):
+        return list(range(count))
+    result = set()
+    for token in re.split(r"[,\s]+", text):
+        if not token:
+            continue
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", token)
+        if not match:
+            raise ValueError(f"not a number or range: {token!r}")
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start > end:
+            start, end = end, start
+        if start < 1 or end > count:
+            raise ValueError(f"out of range 1..{count}: {token!r}")
+        result.update(range(start - 1, end))
+    return sorted(result)
+
+
+# ---------------------------------------------------------------- XML model
+
+class RunConfig:
+    def __init__(self, element):
+        self.element = element
+
+    @property
+    def name(self):
+        return self.element.get("name", "")
+
+    @property
+    def type(self):
+        return self.element.get("type", "")
+
+    @property
+    def key(self):
+        return self.type, self.name
+
+    @property
+    def temporary(self):
+        return self.element.get("temporary") == "true"
+
+    @property
+    def folder(self):
+        return self.element.get("folderName")
+
+    def xml(self):
+        clone = copy.deepcopy(self.element)
+        clone.tail = None
+        return ET.tostring(clone, encoding="unicode").strip()
+
+
+def workspace_path(project):
+    return os.path.join(project, ".idea", "workspace.xml")
+
+
+def load_workspace(project):
+    path = workspace_path(project)
+    if not os.path.exists(path):
+        return None
+    return ET.parse(path)
+
+
+def run_manager(tree):
+    return tree.getroot().find("component[@name='RunManager']")
+
+
+def run_configs(tree):
+    """Return the non-shared configurations, without the templates."""
+    if tree is None:
+        return []
+    manager = run_manager(tree)
+    if manager is None:
+        return []
+    return [RunConfig(e) for e in manager.findall("configuration") if e.get("default") != "true" and e.get("name")]
+
+
+def shared_config_names(project):
+    """Return {(type, name): file} for the shared configurations of the project."""
+    result = {}
+    patterns = [
+        os.path.join(project, ".idea", "runConfigurations", "*.xml"),
+        os.path.join(project, ".run", "*.run.xml"),
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                root = ET.parse(path).getroot()
+            except ET.ParseError:
+                continue
+            for element in root.iter("configuration"):
+                if element.get("name"):
+                    result[(element.get("type", ""), element.get("name"))] = path
+    return result
+
+
+RUN_MANAGER_BLOCK = re.compile(
+    r'<component name="RunManager"(?:\s+[\w:.-]+="[^"]*")*\s*(?:/>|>.*?</component>)', re.DOTALL,
+)
+
+
+def write_workspace(tree, path):
+    """Write the RunManager component. Keep the rest of an existing file byte for byte."""
+    manager = run_manager(tree)
+    tail, manager.tail = manager.tail, None
+    block = ET.tostring(manager, encoding="unicode")
+    manager.tail = tail
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        match = RUN_MANAGER_BLOCK.search(text)
+        if match:
+            text = text[:match.start()] + block + text[match.end():]
+        else:
+            end = text.rindex("</project>")
+            text = text[:end] + "  " + block + "\n" + text[end:]
+    else:
+        text = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(tree.getroot(), encoding="unicode")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def new_workspace():
+    root = ET.Element("project", {"version": "4"})
+    return ET.ElementTree(root)
+
+
+def ensure_run_manager(tree):
+    manager = run_manager(tree)
+    if manager is None:
+        manager = ET.SubElement(tree.getroot(), "component", {"name": "RunManager"})
+    return manager
+
+
+def insert_config(manager, element):
+    """Insert the element after the last configuration and keep the indentation."""
+    element.tail = None
+    children = list(manager)
+    configs = [i for i, child in enumerate(children) if child.tag == "configuration"]
+    index = configs[-1] + 1 if configs else 0
+    child_indent = "\n    "
+    if index == 0:
+        manager.text = child_indent
+        element.tail = child_indent if children else "\n  "
+    else:
+        previous = children[index - 1]
+        element.tail = previous.tail
+        previous.tail = child_indent
+    manager.insert(index, element)
+
+
+# ---------------------------------------------------------------- projects
+
+def git_worktrees(project):
+    try:
+        out = subprocess.run(
+            ["git", "-C", project, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [line[len("worktree "):] for line in out.splitlines() if line.startswith("worktree ")]
+
+
+def recent_projects():
+    result = []
+    for path in sorted(glob.glob(os.path.join(JETBRAINS_CONFIG, "*", "options", "recentProjects.xml"))):
+        try:
+            root = ET.parse(path).getroot()
+        except ET.ParseError:
+            continue
+        for entry in root.iter("entry"):
+            key = entry.get("key", "")
+            if key.startswith("$USER_HOME$"):
+                key = HOME + key[len("$USER_HOME$"):]
+            if key.startswith("/"):
+                result.append(key)
+    return result
+
+
+def candidate_projects(source):
+    seen = {os.path.realpath(source)}
+    result = []
+    for path in git_worktrees(source) + recent_projects():
+        real = os.path.realpath(path)
+        if real in seen or not os.path.isdir(os.path.join(path, ".idea")) and not os.path.isdir(os.path.join(path, ".git")):
+            continue
+        seen.add(real)
+        result.append(path)
+    return result
+
+
+def short_path(path):
+    return "~" + path[len(HOME):] if path.startswith(HOME + "/") else path
+
+
+# ---------------------------------------------------------------- path rewrite
+
+def path_forms(project):
+    forms = []
+    for path in (os.path.realpath(project), os.path.abspath(project)):
+        if path not in forms:
+            forms.append(path)
+        if path.startswith(HOME + "/") and "$USER_HOME$" + path[len(HOME):] not in forms:
+            forms.append("$USER_HOME$" + path[len(HOME):])
+    return forms
+
+
+def path_pattern(path):
+    # Do not match `/x/ultimate` inside `/x/ultimate-2`.
+    return re.compile(re.escape(path) + r"(?![\w.-])")
+
+
+def rewrite_paths(element, source, target):
+    """Replace source project paths with target project paths. Return the count."""
+    target_forms = path_forms(target)
+    pairs = [(old, target_forms[min(i, len(target_forms) - 1)]) for i, old in enumerate(path_forms(source))]
+    count = 0
+
+    def fix(value):
+        nonlocal count
+        for old, new in pairs:
+            value, n = path_pattern(old).subn(new.replace("\\", "\\\\"), value)
+            count += n
+        return value
+
+    for node in element.iter():
+        for attr, value in node.attrib.items():
+            node.set(attr, fix(value))
+        if node.text:
+            node.text = fix(node.text)
+    return count
+
+
+def count_paths(element, source):
+    text = ET.tostring(element, encoding="unicode")
+    return sum(len(path_pattern(form).findall(text)) for form in path_forms(source))
+
+
+# ---------------------------------------------------------------- main flow
+
+def describe(config):
+    extras = [config.type]
+    if config.folder:
+        extras.append(f"folder: {config.folder}")
+    if config.temporary:
+        extras.append("temporary")
+    return f"{config.name}  {dim('[' + ', '.join(extras) + ']')}"
+
+
+def choose_configs(configs, preselect):
+    if preselect:
+        wanted = [c for c in configs if any(p.lower() in c.name.lower() for p in preselect)]
+        if not wanted:
+            sys.exit(red(f"No configuration matches {preselect}."))
+        return wanted
+    print(bold("Non-shared run configurations:"))
+    width = len(str(len(configs)))
+    for i, config in enumerate(configs, 1):
+        print(f"  {str(i).rjust(width)}. {describe(config)}")
+    while True:
+        text = ask("\nSelect configurations (e.g. 1 3 5-7, a = all, q = quit): ")
+        if text.lower() in ("q", "quit"):
+            sys.exit(0)
+        try:
+            indices = parse_selection(text, len(configs))
+        except ValueError as e:
+            print(red(str(e)))
+            continue
+        if indices:
+            return [configs[i] for i in indices]
+
+
+def choose_target(source, given):
+    if given:
+        return os.path.abspath(os.path.expanduser(given))
+    candidates = candidate_projects(source)
+    print(bold("\nTarget project:"))
+    for i, path in enumerate(candidates, 1):
+        marker = "" if os.path.exists(workspace_path(path)) else dim("  (no workspace.xml yet)")
+        print(f"  {i}. {short_path(path)}{marker}")
+    print(f"  {dim('or type a path')}")
+    while True:
+        text = ask("\nCopy to: ")
+        if text.lower() in ("q", "quit"):
+            sys.exit(0)
+        if text.isdigit() and 1 <= int(text) <= len(candidates):
+            return candidates[int(text) - 1]
+        path = os.path.abspath(os.path.expanduser(text))
+        if os.path.isdir(path):
+            return path
+        print(red(f"Not a directory: {text}"))
+
+
+def show_diff(old, new):
+    lines = difflib.unified_diff(
+        old.splitlines(), new.splitlines(), "target", "source", lineterm="",
+    )
+    for line in lines:
+        if line.startswith("+") and not line.startswith("+++"):
+            print(green(line))
+        elif line.startswith("-") and not line.startswith("---"):
+            print(red(line))
+        else:
+            print(line)
+
+
+def unique_name(base, config_type, taken):
+    name = f"{base} (copy)"
+    n = 2
+    while (config_type, name) in taken:
+        name = f"{base} (copy {n})"
+        n += 1
+    return name
+
+
+def resolve_conflicts(selected, target_configs, shared, source, target, rewrite):
+    """Return a list of (action, source element, existing target element or None)."""
+    existing = {c.key: c for c in target_configs}
+    taken = set(existing) | set(shared)
+    plan = []
+    bulk = None  # "o" or "s" after "overwrite all" or "skip all".
+    for config in selected:
+        element = copy.deepcopy(config.element)
+        if rewrite.get(config.key):
+            rewrite_paths(element, source, target)
+        candidate = RunConfig(element)
+        clash = existing.get(config.key)
+        shared_clash = shared.get(config.key)
+
+        if clash is None and shared_clash is None:
+            plan.append(("add", element, None))
+            taken.add(config.key)
+            continue
+
+        if clash is not None and clash.xml() == candidate.xml():
+            print(dim(f"  = {config.name}: identical in the target, skipped."))
+            continue
+
+        print()
+        if clash is not None:
+            print(yellow(f"Conflict: '{config.name}' [{config.type}] already exists in the target workspace."))
+        else:
+            print(yellow(f"Conflict: '{config.name}' [{config.type}] is a shared configuration in the target:"))
+            print(f"  {short_path(shared_clash)}")
+
+        while True:
+            if bulk:
+                choice = bulk
+            elif clash is not None:
+                choice = ask("  [o]verwrite  [s]kip  [r]ename  [d]iff  [O]verwrite all  [S]kip all: ")
+            else:
+                choice = ask("  [a]dd anyway  [s]kip  [r]ename  [S]kip all: ")
+            if choice in ("O", "S"):
+                bulk = choice.lower()
+                choice = bulk
+            if choice == "d" and clash is not None:
+                show_diff(clash.xml(), candidate.xml())
+                continue
+            if choice == "o" and clash is not None:
+                plan.append(("overwrite", element, clash.element))
+                break
+            if choice == "a" and clash is None:
+                plan.append(("add", element, None))
+                break
+            if choice == "s":
+                print(dim(f"  - {config.name}: skipped."))
+                break
+            if choice == "r":
+                default = unique_name(config.name, config.type, taken)
+                while True:
+                    name = ask(f"  New name [{default}]: ", default)
+                    if (config.type, name) not in taken:
+                        break
+                    print(red(f"  '{name}' is taken too."))
+                element.set("name", name)
+                element.attrib.pop("nameIsGenerated", None)
+                taken.add((config.type, name))
+                plan.append(("add", element, None))
+                break
+            if bulk:
+                # A bulk choice that does not apply here, for example "o" on a shared clash.
+                bulk = None
+            print(red("  Unknown choice."))
+    return plan
+
+
+def ask_path_rewrite(selected, source, target, mode):
+    """Return {(type, name): bool}, true when the paths of the configuration get rewritten."""
+    hits = [(c, count_paths(c.element, source)) for c in selected]
+    hits = [(c, n) for c, n in hits if n]
+    if not hits:
+        return {}
+    print(yellow(f"\n{len(hits)} configuration(s) contain the absolute source path {short_path(os.path.realpath(source))}:"))
+    for config, n in hits:
+        print(f"  {config.name}  {dim(f'({n}x)')}")
+    if mode == "ask":
+        rewrite = confirm(f"Rewrite these paths to {short_path(os.path.realpath(target))}?", default=True)
+    else:
+        rewrite = mode == "yes"
+    return {config.key: rewrite for config, _ in hits}
+
+
+def apply_plan(plan, target_tree, target):
+    created = run_manager(target_tree) is None
+    manager = ensure_run_manager(target_tree)
+    for action, element, old in plan:
+        if action == "overwrite":
+            index = list(manager).index(old)
+            element.tail = old.tail
+            manager.remove(old)
+            manager.insert(index, element)
+        else:
+            insert_config(manager, element)
+    path = workspace_path(target)
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+        if created:
+            ET.indent(manager, space="  ", level=1)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ET.indent(target_tree, space="  ")
+    write_workspace(target_tree, path)
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Copy non-shared IntelliJ IDEA run configurations to another project.",
+    )
+    parser.add_argument("--from", dest="source", default=".", help="source project (default: current directory)")
+    parser.add_argument("--to", dest="target", help="target project (default: ask)")
+    parser.add_argument("--name", action="append", help="select configurations whose name contains this text; repeatable")
+    parser.add_argument("--list", action="store_true", help="list the non-shared configurations and exit")
+    parser.add_argument("--rewrite-paths", choices=["ask", "yes", "no"], default="ask",
+                        help="rewrite absolute source project paths to the target path (default: ask)")
+    parser.add_argument("--dry-run", action="store_true", help="show the plan, do not write")
+    parser.add_argument("-y", "--yes", action="store_true", help="do not ask for the final confirmation")
+    args = parser.parse_args()
+
+    source = os.path.abspath(os.path.expanduser(args.source))
+    source_tree = load_workspace(source)
+    if source_tree is None:
+        sys.exit(red(f"No .idea/workspace.xml in {source}."))
+    configs = run_configs(source_tree)
+    if not configs:
+        sys.exit(f"No non-shared run configurations in {source}.")
+
+    if args.list:
+        for config in configs:
+            print(describe(config))
+        return
+
+    print(dim(f"Source: {short_path(source)}\n"))
+    selected = choose_configs(configs, args.name)
+    target = choose_target(source, args.target)
+    if os.path.realpath(target) == os.path.realpath(source):
+        sys.exit(red("The target is the source project."))
+
+    target_tree = load_workspace(target) or new_workspace()
+    rewrite = ask_path_rewrite(selected, source, target, args.rewrite_paths)
+    print(bold(f"\nChecking {short_path(target)} for conflicts..."))
+    plan = resolve_conflicts(selected, run_configs(target_tree), shared_config_names(target), source, target, rewrite)
+
+    if not plan:
+        print("\nNothing to copy.")
+        return
+
+    print(bold("\nPlan:"))
+    for action, element, _ in plan:
+        print(f"  {action:9} {element.get('name')}  {dim('[' + element.get('type', '') + ']')}")
+    if args.dry_run:
+        print(dim("\nDry run, nothing written."))
+        return
+
+    print(yellow(f"\nClose {short_path(target)} in IDEA first. IDEA overwrites workspace.xml on save."))
+    if not args.yes and not confirm("Write the changes?"):
+        return
+    path = apply_plan(plan, target_tree, target)
+    print(green(f"Wrote {len(plan)} configuration(s) to {short_path(path)}."))
+    if os.path.exists(path + ".bak"):
+        print(dim(f"Backup: {short_path(path)}.bak"))
+
+
+if __name__ == "__main__":
+    main()
